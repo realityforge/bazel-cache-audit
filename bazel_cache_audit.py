@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Read-only inventory of local Bazel cache deletion candidates."""
+"""Identify local Bazel cache deletion candidates; optionally delete them."""
 
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field
 import errno
 import getpass
@@ -11,9 +12,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 
 
 @dataclass
@@ -40,6 +43,8 @@ class Entry:
     reason: str = ""
     size_bytes: int | None = None
     size_complete: bool | None = None
+    deleted: bool = False
+    delete_error: str | None = None
 
 
 def absolute(path: str | Path) -> Path:
@@ -270,7 +275,7 @@ def lock_state(base: Path) -> str:
         return "unknown"
 
 
-def classify(entry: Entry, snapshot: Processes, level: int) -> None:
+def classify(entry: Entry, snapshot: Processes, level: int, *, locked: bool = False) -> None:
     base = Path(entry.path)
     try:
         if base.is_symlink() or not base.is_dir():
@@ -310,7 +315,8 @@ def classify(entry: Entry, snapshot: Processes, level: int) -> None:
                     entry.pids.append(pid)
             except FileNotFoundError:
                 pass
-            lock = lock_state(base)
+            # Opening/closing another descriptor would release our POSIX lock.
+            lock = "free" if locked else lock_state(base)
             if entry.pids or lock == "held":
                 entry.state = "active"
                 entry.pids = sorted(set(entry.pids))
@@ -359,6 +365,83 @@ def measure(path: Path) -> tuple[int, bool]:
     return size, complete
 
 
+def delete_entry(entry: Entry, level: int) -> Entry:
+    if not entry.candidate:
+        return entry
+    checked = Entry(entry.path, entry.kind, size_bytes=entry.size_bytes,
+                    size_complete=entry.size_complete)
+    base = Path(entry.path)
+    holding = None
+    moved = None
+    try:
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise ValueError("this platform cannot safely remove directory trees")
+        real = base.resolve()
+        if any(path.resolve().is_relative_to(real) for path in (Path.home(), Path.cwd())):
+            raise ValueError("refusing to remove a home directory, current directory, or its ancestor")
+        if any(present(base / name) for name in (".git", "MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel")):
+            raise ValueError("refusing to remove a source checkout")
+        if entry.kind not in {"output-base", "repository-cache"}:
+            raise ValueError("unrecognized cache kind")
+        with ExitStack() as stack:
+            directory = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            stack.callback(os.close, directory)
+            original = os.fstat(directory)
+            locked = entry.kind == "output-base"
+            if locked:
+                import fcntl
+                lock = os.open("lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600,
+                               dir_fd=directory)
+                stack.callback(os.close, lock)
+                fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB, 1)
+                if not os.path.samestat(os.fstat(lock), os.stat("lock", dir_fd=directory, follow_symlinks=False)):
+                    raise ValueError("client lock changed during inspection")
+            classify(checked, processes(), level, locked=locked)
+            if not checked.candidate:
+                raise ValueError(f"no longer a selected candidate: {checked.reason}")
+            if checked.workspace and Path(checked.workspace).resolve().is_relative_to(real):
+                raise ValueError("refusing to remove a directory containing its workspace")
+            if not os.path.samestat(original, base.lstat()):
+                raise ValueError("cache directory changed during inspection")
+            # Detach the old tree so a new build cannot populate it while we remove it.
+            holding = Path(tempfile.mkdtemp(prefix=".bazel-cache-audit-", dir=base.parent))
+            moved = holding / "cache"
+            base.rename(moved)
+            if not os.path.samestat(original, moved.lstat()):
+                raise ValueError("cache directory changed before it was moved; no contents removed")
+            if locked:
+                # Waiting Bazel clients must reopen the original path, not this old inode.
+                (moved / "lock").unlink()
+
+            def walk_error(exc: OSError) -> None:
+                raise exc
+
+            # Bazel makes some repository directories read-only. Change only real
+            # directories reached through file descriptors, never symlink targets.
+            for _, _, _, descriptor in os.fwalk(".", dir_fd=directory, follow_symlinks=False,
+                                               onerror=walk_error):
+                info = os.fstat(descriptor)
+                if info.st_dev != original.st_dev:
+                    raise ValueError("cache contains another filesystem; refusing to traverse it")
+                if not info.st_mode & stat.S_IWUSR:
+                    os.fchmod(descriptor, stat.S_IMODE(info.st_mode) | stat.S_IWUSR)
+            shutil.rmtree(moved)
+            moved = None
+            checked.deleted = True
+            checked.candidate = False
+    except (OSError, ValueError, ImportError) as exc:
+        checked.delete_error = str(exc)
+        if moved is not None:
+            checked.delete_error += f"; remaining data may be at {moved}"
+    finally:
+        if holding is not None:
+            try:
+                holding.rmdir()
+            except OSError:
+                pass  # Preserve remaining data after a failed removal.
+    return checked
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-dir", action="append", default=[], metavar="PATH",
@@ -370,6 +453,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="include candidates through this level (default: 1)")
     parser.add_argument("--sizes", action="store_true", help="sum regular file sizes without following symlinks (can be slow)")
     parser.add_argument("--json", action="store_true", help="emit a JSON report")
+    parser.add_argument("--delete", action="store_true",
+                        help="delete selected candidates after rechecking them; default is read-only")
     args = parser.parse_args(argv)
     try:
         roots = [absolute(path) for path in args.base_dir] if args.base_dir else default_roots(args.user)
@@ -385,14 +470,20 @@ def main(argv: list[str] | None = None) -> int:
                 pass  # Discovery already reported this error.
     snapshot = processes()
     warnings.extend(snapshot.errors)
-    for entry in entries:
+    for index, entry in enumerate(entries):
         classify(entry, snapshot, args.level)
         if args.sizes and entry.kind != "unrecognized" and not Path(entry.path).is_symlink():
             entry.size_bytes, entry.size_complete = measure(Path(entry.path))
+        if args.delete and entry.candidate:
+            if warnings:
+                entry.delete_error = "scan warnings prevent deletion; resolve them and rerun"
+            else:
+                entries[index] = delete_entry(entry, args.level)
     report = {
-        "level": args.level, "roots": [str(root) for root in roots],
+        "level": args.level, "delete_requested": args.delete, "roots": [str(root) for root in roots],
         "warnings": warnings, "entries": [asdict(entry) for entry in entries],
-        "notice": "Read-only snapshot. Stop builds before removal; rerun immediately before acting. Shared/network caches and other PID namespaces require checks on every host/namespace.",
+        "notice": ("Deletion requested; selected candidates were rechecked." if args.delete else "Read-only snapshot. Stop builds before removal; rerun immediately before acting.")
+                  + " Shared/network caches and other PID namespaces require checks on every host/namespace.",
     }
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=True))
@@ -401,19 +492,22 @@ def main(argv: list[str] | None = None) -> int:
         print("Roots: " + ", ".join(json.dumps(str(root), ensure_ascii=True) for root in roots))
         for entry in entries:
             label = f"L{entry.level}" if entry.level else entry.state.upper()
-            choice = "candidate" if entry.candidate else "keep"
+            choice = "deleted" if entry.deleted else ("candidate" if entry.candidate else "keep")
             print(f"\n[{label} {choice}] {json.dumps(entry.path, ensure_ascii=True)}")
             if entry.workspace:
                 print(f"  Workspace: {json.dumps(entry.workspace, ensure_ascii=True)}")
             print(f"  {entry.reason}")
+            if entry.delete_error:
+                print(f"  Deletion skipped or failed: {entry.delete_error}")
             if entry.pids:
                 print(f"  PIDs: {', '.join(map(str, entry.pids))}")
             if entry.size_bytes is not None:
                 print(f"  File bytes: {entry.size_bytes:,}" + (" (partial)" if not entry.size_complete else ""))
-        print(f"\n{sum(entry.candidate for entry in entries)} candidate(s), {len(entries)} entries; level {args.level}.")
+        print(f"\n{sum(entry.candidate for entry in entries)} candidate(s), "
+              f"{sum(entry.deleted for entry in entries)} deleted, {len(entries)} entries; level {args.level}.")
         for warning in warnings:
             print(f"Warning: {warning}", file=sys.stderr)
-    return 1 if warnings else 0
+    return 1 if warnings or any(entry.delete_error for entry in entries) else 0
 
 
 if __name__ == "__main__":

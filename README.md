@@ -1,6 +1,6 @@
 # bazel-cache-audit
 
-Find local Bazel cache directories that may be worth deleting. The script is read-only: it reports paths, evidence, and a safety level. It never deletes files, stops processes, or runs Bazel.
+Find local Bazel cache directories that may be worth deleting. By default, the script reports paths, evidence, and a safety level without changing files. Add `--delete` to remove selected candidates. It never stops processes or runs Bazel.
 
 Requires Python 3.10 or newer. Uses only the standard library. Process detection supports Linux (`/proc`) and macOS (`ps`).
 
@@ -30,6 +30,12 @@ python3 bazel_cache_audit.py --level 3 --json
 
 # Scan an explicit output root, output user root, or individual output base.
 python3 bazel_cache_audit.py --base-dir /path/to/bazel-cache --level 2
+
+# Delete candidates through level 1 after reviewing the default report.
+python3 bazel_cache_audit.py --level 1 --delete
+
+# Delete inactive output bases within an explicit root.
+python3 bazel_cache_audit.py --base-dir /path/to/bazel-cache --level 2 --delete
 
 # Scan multiple roots and a repository cache stored elsewhere.
 python3 bazel_cache_audit.py \
@@ -72,7 +78,11 @@ See Bazel's [output directory layout](https://bazel.build/remote/output-director
 
 ## Before removing anything
 
-A candidate is evidence from one moment, not a guarantee against a concurrent build. Stop new builds, shut down the relevant Bazel servers, and rerun the audit immediately before removing reviewed paths. The script releases its temporary read lock after checking it; it does not reserve directories for deletion or generate removal commands.
+A candidate is evidence from one moment, not a guarantee against a concurrent build. Stop new builds, shut down the relevant Bazel servers, and review the audit before using `--delete`. The flag performs deletion without an interactive confirmation; the selected level and roots determine its scope. Scan or process warnings prevent deletion.
+
+Before each deletion, the script refreshes process and workspace checks. For output bases it holds an exclusive Bazel client lock during removal. It moves the cache into a private sibling directory before deleting its contents, so a new build can recreate the original path independently. Directory identity checks and symlink-safe traversal prevent following cache symlinks into source files. Read-only cache directories are made writable through file descriptors. Home directories, the current directory and its ancestors, source checkouts, and output bases containing their workspace are rejected.
+
+If removal fails after the move, the report identifies the remaining directory under `.bazel-cache-audit-*` beside the original cache. Inspect that path before retrying or recovering its contents. Partial deletion is not rolled back. The script does not provide a shared repository-cache lock or freeze new builds, and cannot verify activity on other hosts or in other PID namespaces.
 
 Mount workspace volumes before auditing: an unmounted workspace can look deleted. For shared/network caches, containers, PID namespaces, or caches accessible from other hosts, check all users and hosts separately. Local process inspection cannot establish that a remote host is idle. Keep caches needed for offline work or dependencies that may no longer be downloadable.
 
@@ -80,11 +90,21 @@ Mount workspace volumes before auditing: an unmounted workspace can look deleted
 
 Reports contain local paths and PIDs. Review them before sharing. Reports omit environment dumps and process command lines.
 
+## Cron
+
+Use absolute paths in a host crontab. For daily level 1 cleanup at 3:45 am in the host's timezone:
+
+```cron
+45 3 * * * /usr/bin/python3 /absolute/path/bazel_cache_audit.py --level 1 --delete >> /absolute/path/bazel-cache-audit.log 2>&1
+```
+
+Run the command manually first and review its output. The host must be running at the scheduled time, and any workspace volumes must be mounted. A scheduled run keeps active or uncertain caches under the same rules as an interactive run.
+
 ## JSON and exit status
 
-Each entry includes `path`, `kind`, `state`, `level`, `candidate`, `workspace`, `pids`, `reason`, and optional size results. Filter on `candidate: true`, not on the level alone. `level` is null when activity or uncertainty prevents classification.
+Each entry includes `path`, `kind`, `state`, `level`, `candidate`, `workspace`, `pids`, `reason`, and optional size results. Filter on `candidate: true`, not on the level alone. `level` is null when activity or uncertainty prevents classification. The report's `delete_requested` field records the mode; entries have `deleted` and `delete_error` fields. Successfully deleted entries have `deleted: true` and `candidate: false`.
 
-Exit status is `0` for a completed scan, `1` for scan/process warnings (a partial report is still printed), and `2` for invalid arguments. An entry marked `unknown` may appear in an otherwise completed scan. No discovered entries is a valid empty result; the report lists the roots it checked. Windows process detection is unsupported and cannot produce candidates.
+Exit status is `0` for a completed operation, `1` for scan/process warnings or skipped/failed candidate deletions (a partial report is still printed), and `2` for invalid arguments. Active and unknown entries are kept; they do not cause a deletion error unless they became unsafe after selection. No discovered entries is a valid empty result; the report lists the roots it checked. Windows process detection is unsupported and cannot produce candidates. Deletion requires POSIX file descriptors and symlink-safe `shutil.rmtree` support.
 
 ## Development
 
@@ -92,4 +112,4 @@ Exit status is `0` for a completed scan, `1` for scan/process warnings (a partia
 python3 -m unittest discover -s tests -v
 ```
 
-Tests use temporary synthetic workspaces and caches, including real process liveness and POSIX file locks. CI runs on Linux and macOS.
+Tests use temporary synthetic workspaces and caches, including actual deletion, read-only directories, process liveness, POSIX file locks, and preservation of symlink targets. CI runs on Linux and macOS.

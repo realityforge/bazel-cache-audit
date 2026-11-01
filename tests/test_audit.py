@@ -302,6 +302,207 @@ class AuditTest(unittest.TestCase):
         with patch.object(audit.sys, "platform", "win32"):
             self.assertTrue(audit.processes().errors)
 
+    def delete(self, entry=None, level=1, snapshot=None):
+        entry = entry or self.entry(level=level)
+        with patch.object(audit, "processes", return_value=snapshot or audit.Processes()):
+            return audit.delete_entry(entry, level)
+
+    def test_delete_orphan_removes_only_cache(self):
+        self.workspace.parent.mkdir(parents=True)
+        sentinel = self.workspace.parent / "keep"
+        sentinel.write_text("source")
+        result = self.delete()
+        self.assertTrue(result.deleted)
+        self.assertFalse(result.candidate)
+        self.assertIsNone(result.delete_error)
+        self.assertFalse(self.base.exists())
+        self.assertEqual(sentinel.read_text(), "source")
+        self.assertFalse(list(self.base.parent.glob(".bazel-cache-audit-*")))
+
+    def test_delete_level_one_keeps_existing_workspace_cache(self):
+        self.workspace.mkdir(parents=True)
+        self.assertFalse(self.delete().deleted)
+        self.assertTrue(self.base.is_dir())
+        self.assertTrue(self.delete(level=2).deleted)
+        self.assertTrue(self.workspace.is_dir())
+
+    def test_delete_rechecks_new_live_pid(self):
+        planned = self.entry(level=1)
+        self.server_file("server.pid.txt", str(os.getpid()).encode())
+        result = self.delete(planned)
+        self.assertFalse(result.deleted)
+        self.assertEqual(result.state, "active")
+        self.assertIsNotNone(result.delete_error)
+        self.assertTrue(self.base.is_dir())
+
+    def test_delete_rechecks_workspace_appearance(self):
+        planned = self.entry(level=1)
+        self.workspace.mkdir(parents=True)
+        result = self.delete(planned)
+        self.assertFalse(result.deleted)
+        self.assertEqual(result.level, 2)
+        self.assertTrue(self.base.is_dir())
+
+    def test_delete_rechecks_incomplete_process_inventory(self):
+        result = self.delete(snapshot=audit.Processes(errors=["incomplete"]))
+        self.assertFalse(result.deleted)
+        self.assertIsNotNone(result.delete_error)
+        self.assertTrue(self.base.is_dir())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX locks")
+    def test_delete_blocks_new_clients_during_recheck(self):
+        planned = self.entry(level=1)
+
+        def inspect():
+            script = (
+                "import fcntl,sys; f=open(sys.argv[1],'r+'); "
+                "\ntry: fcntl.lockf(f,fcntl.LOCK_EX|fcntl.LOCK_NB,1)"
+                "\nexcept BlockingIOError: sys.exit(0)"
+                "\nelse: sys.exit(1)"
+            )
+            result = subprocess.run([sys.executable, "-c", script, str(self.base / "lock")], timeout=10)
+            self.assertEqual(result.returncode, 0)
+            return audit.Processes()
+
+        with patch.object(audit, "processes", side_effect=inspect):
+            self.assertTrue(audit.delete_entry(planned, 1).deleted)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX locks")
+    def test_delete_keeps_cache_if_client_takes_lock_after_audit(self):
+        planned = self.entry(level=1)
+        lock = self.base / "lock"
+        lock.touch()
+        script = (
+            "import fcntl,sys; f=open(sys.argv[1],'r+'); "
+            "fcntl.lockf(f,fcntl.LOCK_EX,1); print('ready',flush=True); sys.stdin.read()"
+        )
+        child = subprocess.Popen([sys.executable, "-c", script, str(lock)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            result = self.delete(planned)
+            self.assertFalse(result.deleted)
+            self.assertIsNotNone(result.delete_error)
+            self.assertTrue(self.base.is_dir())
+        finally:
+            child.communicate(timeout=10)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX links")
+    def test_delete_handles_readonly_directories_without_changing_symlink_targets(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        sentinel = outside / "keep"
+        sentinel.write_text("source")
+        (self.base / "external-link").symlink_to(outside, target_is_directory=True)
+        nested = self.base / "external/repository"
+        nested.mkdir(parents=True)
+        (nested / "artifact").write_text("generated")
+        nested.chmod(0o555)
+        outside.chmod(0o555)
+        try:
+            result = self.delete()
+            self.assertTrue(result.deleted, result.delete_error)
+            self.assertEqual(sentinel.read_text(), "source")
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o555)
+        finally:
+            outside.chmod(0o755)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX links")
+    def test_delete_rejects_root_replaced_with_symlink(self):
+        planned = self.entry(level=1)
+        original = self.base.with_name("original")
+        self.base.rename(original)
+        self.base.symlink_to(original, target_is_directory=True)
+        result = self.delete(planned)
+        self.assertFalse(result.deleted)
+        self.assertTrue((original / "DO_NOT_BUILD_HERE").is_file())
+
+    def test_delete_rejects_source_checkout(self):
+        (self.base / ".git").mkdir()
+        result = self.delete()
+        self.assertFalse(result.deleted)
+        self.assertIn("source checkout", result.delete_error)
+        self.assertFalse((self.base / "lock").exists())
+
+    def test_delete_preserves_replacement_directory_if_rename_races(self):
+        planned = self.entry(level=1)
+        source = self.root / "source-checkout"
+        source.mkdir()
+        (source / "keep").write_text("source")
+        original = self.base.with_name("original")
+        rename = Path.rename
+
+        def replace(path, target):
+            if path == self.base:
+                rename(path, original)
+                rename(source, path)
+            return rename(path, target)
+
+        with patch.object(audit.Path, "rename", replace):
+            result = self.delete(planned)
+        self.assertFalse(result.deleted)
+        self.assertIn("no contents removed", result.delete_error)
+        preserved = next(self.base.parent.glob(".bazel-cache-audit-*/cache/keep"))
+        self.assertEqual(preserved.read_text(), "source")
+        self.assertTrue((original / "DO_NOT_BUILD_HERE").is_file())
+
+    def test_delete_rejects_home_directory(self):
+        planned = self.entry(level=1)
+        with patch.object(audit.Path, "home", return_value=self.base):
+            result = self.delete(planned)
+        self.assertFalse(result.deleted)
+        self.assertTrue(self.base.is_dir())
+
+    def test_delete_rejects_cache_containing_workspace(self):
+        workspace = self.base / "source"
+        workspace.mkdir()
+        (self.base / "DO_NOT_BUILD_HERE").write_bytes(os.fsencode(workspace))
+        result = self.delete(level=2)
+        self.assertFalse(result.deleted)
+        self.assertIn("containing its workspace", result.delete_error)
+        self.assertTrue(workspace.is_dir())
+
+    def test_delete_shared_cache_rechecks_all_bazel_processes(self):
+        repo = self.root / "repository-cache"
+        repo.mkdir()
+        planned = audit.Entry(str(repo), "repository-cache")
+        audit.classify(planned, audit.Processes(), 3)
+        result = self.delete(planned, level=3, snapshot=audit.Processes([audit.Process(123, "/elsewhere")]))
+        self.assertFalse(result.deleted)
+        self.assertTrue(repo.is_dir())
+        self.assertTrue(self.delete(planned, level=3).deleted)
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0, "requires unprivileged POSIX permissions")
+    def test_delete_failure_preserves_remaining_data_and_reports_location(self):
+        locked = self.base / "unreadable"
+        locked.mkdir()
+        (locked / "keep").write_text("data")
+        locked.chmod(0)
+        result = self.delete()
+        self.assertFalse(result.deleted)
+        self.assertIn("remaining data may be at", result.delete_error)
+        moved = next(self.base.parent.glob(".bazel-cache-audit-*/cache"))
+        (moved / "unreadable").chmod(0o700)
+        self.assertEqual((moved / "unreadable/keep").read_text(), "data")
+
+    def test_delete_cli_reports_deleted(self):
+        output = io.StringIO()
+        with patch.object(audit, "processes", return_value=audit.Processes()), contextlib.redirect_stdout(output):
+            code = audit.main(["--base-dir", str(self.base), "--delete", "--json"])
+        report = json.loads(output.getvalue())
+        self.assertEqual(code, 0)
+        self.assertTrue(report["delete_requested"])
+        self.assertTrue(report["entries"][0]["deleted"])
+        self.assertFalse(self.base.exists())
+
+    def test_delete_cli_aborts_on_scan_warning(self):
+        output = io.StringIO()
+        with patch.object(audit, "processes", return_value=audit.Processes()), contextlib.redirect_stdout(output):
+            code = audit.main(["--base-dir", str(self.base), "--base-dir", str(self.root / "missing"), "--delete", "--json"])
+        self.assertEqual(code, 1)
+        self.assertFalse(json.loads(output.getvalue())["entries"][0]["deleted"])
+        self.assertTrue(self.base.is_dir())
+
 
 if __name__ == "__main__":
     unittest.main()
